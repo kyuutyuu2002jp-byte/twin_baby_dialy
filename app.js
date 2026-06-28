@@ -5,6 +5,7 @@ import {
   addDoc,
   deleteDoc,
   doc,
+  setDoc,
   onSnapshot,
   query,
   orderBy,
@@ -27,6 +28,11 @@ const Icons = {
   CalendarDays: (props) => e("span", { ...iconStyle(props) }, "🗓️"),
   CalendarRange: (props) => e("span", { ...iconStyle(props) }, "📆"),
   Loader: (props) => e("span", { ...iconStyle(props) }, "…"),
+  Pee: (props) => e("span", { ...iconStyle(props) }, "💧"),
+  Poop: (props) => e("span", { ...iconStyle(props) }, "💩"),
+  Burp: (props) => e("span", { ...iconStyle(props) }, "🌬️"),
+  Syringe: (props) => e("span", { ...iconStyle(props) }, "💉"),
+  Ruler: (props) => e("span", { ...iconStyle(props) }, "📏"),
 };
 function iconStyle({ size = 16 }) {
   return { style: { fontSize: size, lineHeight: 1, display: "inline-block" } };
@@ -46,6 +52,7 @@ const FIREBASE_CONFIG = {
 const app = initializeApp(FIREBASE_CONFIG);
 const db = getFirestore(app);
 const ENTRIES_COLLECTION = "twinlog_entries";
+const SETTINGS_DOC = doc(db, "twinlog_settings", "twin_names");
 
 // ---------------- 設定 ----------------
 const TWINS_DEFAULT = {
@@ -56,9 +63,49 @@ const TWINS_DEFAULT = {
 const EVENT_TYPES = {
   feed: { label: "授乳・ミルク", icon: Icons.Milk, unit: "ml" },
   sleep: { label: "寝る/起きる", icon: Icons.Moon, unit: null },
-  diaper: { label: "おむつ", icon: Icons.Droplets, unit: null },
+  pee: { label: "おしっこ", icon: Icons.Pee, unit: null },
+  poop: { label: "うんち", icon: Icons.Poop, unit: null },
+  burp: { label: "ゲップ/吐き戻し", icon: Icons.Burp, unit: null },
   temp: { label: "体温", icon: Icons.Thermometer, unit: "℃" },
+  growth: { label: "身長・体重", icon: Icons.Ruler, unit: null },
+  vaccine: { label: "予防接種", icon: Icons.Syringe, unit: null },
+  // diaper(旧「おむつ」)は新規記録では使わないが、過去データの表示のため定義を残す
+  diaper: { label: "おむつ", icon: Icons.Droplets, unit: null },
 };
+
+// メインのアクションボタンに出す記録タイプ(diaperは旧データ表示専用のため除外)
+const PRIMARY_EVENT_KEYS = ["feed", "sleep", "pee", "poop", "burp", "temp", "growth"];
+
+// ---------------- 予防接種マスターデータ ----------------
+// 標準的な接種開始の目安(月齢)。あくまで目安であり、ワクチンの種類や自治体・体調によって
+// 実際のスケジュールは異なる。正確な接種計画は必ず医療機関・母子手帳で確認すること。
+const VACCINE_LIST = [
+  { id: "hepb", name: "B型肝炎", standardMonths: 2, doses: 3, optional: false },
+  { id: "rota", name: "ロタウイルス", standardMonths: 2, doses: 2, optional: false, note: "1回目は生後14週6日までが目安" },
+  { id: "pcv", name: "小児用肺炎球菌", standardMonths: 2, doses: 4, optional: false },
+  { id: "penta", name: "五種混合(DPT-IPV-Hib)", standardMonths: 2, doses: 4, optional: false },
+  { id: "bcg", name: "BCG", standardMonths: 5, doses: 1, optional: false },
+  { id: "jenc1", name: "日本脳炎(1期)", standardMonths: 36, doses: 3, optional: false },
+  { id: "mr1", name: "麻疹・風疹混合(MR)1期", standardMonths: 12, doses: 1, optional: false },
+  { id: "varicella", name: "水痘(みずぼうそう)", standardMonths: 12, doses: 2, optional: false },
+  { id: "mumps", name: "おたふくかぜ", standardMonths: 12, doses: 2, optional: true },
+  { id: "mr2", name: "麻疹・風疹混合(MR)2期", standardMonths: 60, doses: 1, optional: false, note: "年長(5〜6歳)の時期が目安" },
+];
+
+// 生年月日と現在日時から、月齢(満月数)を計算する
+function monthsBetween(birthDate, targetDate) {
+  let months = (targetDate.getFullYear() - birthDate.getFullYear()) * 12;
+  months += targetDate.getMonth() - birthDate.getMonth();
+  if (targetDate.getDate() < birthDate.getDate()) months -= 1;
+  return Math.max(0, months);
+}
+
+// 生年月日から、各ワクチンの「標準的な接種開始の目安日」を計算する
+function calcVaccineDueDate(birthDate, standardMonths) {
+  const d = new Date(birthDate);
+  d.setMonth(d.getMonth() + standardMonths);
+  return d;
+}
 
 // ---------------- 日付ユーティリティ ----------------
 function pad(n) { return n.toString().padStart(2, "0"); }
@@ -126,6 +173,22 @@ function TwinCareLog() {
   const [dayCursor, setDayCursor] = useState(dayKey());
   const [weekCursor, setWeekCursor] = useState(dayKey());
   const [yearCursor, setYearCursor] = useState(new Date().getFullYear());
+  const [settingsDoc, setSettingsDoc] = useState({
+    a: TWINS_DEFAULT.a.label,
+    b: TWINS_DEFAULT.b.label,
+    birthDateA: "",
+    birthDateB: "",
+  });
+  const [showSettings, setShowSettings] = useState(false);
+
+  // 双子の名前は色・IDはそのままに、表示名だけをFirestoreの設定値で上書きする
+  const twins = useMemo(
+    () => ({
+      a: { ...TWINS_DEFAULT.a, label: settingsDoc.a || TWINS_DEFAULT.a.label },
+      b: { ...TWINS_DEFAULT.b, label: settingsDoc.b || TWINS_DEFAULT.b.label },
+    }),
+    [settingsDoc]
+  );
 
   // Firestoreのリアルタイムリスナー(夫婦間で即時同期)
   useEffect(() => {
@@ -147,15 +210,46 @@ function TwinCareLog() {
     return () => unsub();
   }, []);
 
-  function openSheet(twin, type) { setSheet({ twin, type }); }
+  // 名前・生年月日もFirestoreでリアルタイム同期(夫婦どちらで変更しても即時反映)
+  useEffect(() => {
+    const unsub = onSnapshot(
+      SETTINGS_DOC,
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          setSettingsDoc({
+            a: data.a || TWINS_DEFAULT.a.label,
+            b: data.b || TWINS_DEFAULT.b.label,
+            birthDateA: data.birthDateA || "",
+            birthDateB: data.birthDateB || "",
+          });
+        }
+      },
+      (err) => console.error("設定の同期エラー:", err)
+    );
+    return () => unsub();
+  }, []);
 
-  async function addLog(detail) {
+  async function saveSettings(next) {
+    setSettingsDoc(next);
+    try {
+      await setDoc(SETTINGS_DOC, next);
+    } catch (err) {
+      console.error("設定の保存に失敗:", err);
+      setConnError(true);
+    }
+  }
+
+  function openSheet(twin, type, recordDay) { setSheet({ twin, type, recordDay: recordDay || dayKey() }); }
+
+  // detailに加えて、記録する日付・時刻も指定できるようにする(過去日への記録に対応)
+  async function addLog(detail, recordDay, recordTime) {
     if (!sheet) return;
     const entry = {
       twin: sheet.twin,
       type: sheet.type,
-      time: nowHHMM(),
-      day: dayKey(),
+      time: recordTime || nowHHMM(),
+      day: recordDay || dayKey(),
       detail,
       createdAt: Date.now(),
     };
@@ -184,7 +278,7 @@ function TwinCareLog() {
   return e(
     "div",
     { style: styles.page },
-    e(Header),
+    e(Header, { onOpenSettings: () => setShowSettings(true) }),
     e(ViewTabs, { view, setView }),
     connError &&
       e(
@@ -193,21 +287,40 @@ function TwinCareLog() {
         "サーバーとの通信に失敗しました。ネット接続を確認してください。記録は接続が戻ると同期されます。"
       ),
     view === "day" &&
-      e(DayView, { logs, dayCursor, setDayCursor, onAction: openSheet, onRemove: removeLog }),
-    view === "week" && e(WeekView, { logs, weekCursor, setWeekCursor }),
-    view === "year" && e(YearView, { logs, yearCursor, setYearCursor }),
+      e(DayView, { logs, twins, dayCursor, setDayCursor, onAction: openSheet, onRemove: removeLog }),
+    view === "week" && e(WeekView, { logs, twins, weekCursor, setWeekCursor }),
+    view === "year" && e(YearView, { logs, twins, yearCursor, setYearCursor }),
+    view === "vaccine" &&
+      e(VaccineView, {
+        logs,
+        twins,
+        settingsDoc,
+        onAction: openSheet,
+        onRemove: removeLog,
+      }),
     sheet &&
       e(EntrySheet, {
-        twin: TWINS_DEFAULT[sheet.twin],
+        twin: twins[sheet.twin],
         type: sheet.type,
+        recordDay: sheet.recordDay,
         onSave: addLog,
         onClose: () => setSheet(null),
+      }),
+    showSettings &&
+      e(SettingsSheet, {
+        twins,
+        settingsDoc,
+        onSave: (next) => {
+          saveSettings(next);
+          setShowSettings(false);
+        },
+        onClose: () => setShowSettings(false),
       })
   );
 }
 
 // ---------------- ヘッダー & タブ ----------------
-function Header() {
+function Header({ onOpenSettings }) {
   return e(
     "div",
     { style: styles.header },
@@ -217,7 +330,16 @@ function Header() {
       e("div", { style: styles.headerEyebrow }, "ふたごノート"),
       e("div", { style: styles.headerDate }, "育児記録")
     ),
-    e(Icons.Baby, { size: 26 })
+    e(
+      "div",
+      { style: styles.headerRight },
+      e(
+        "button",
+        { style: styles.settingsBtn, onClick: onOpenSettings, "aria-label": "設定" },
+        e("span", { style: { fontSize: 18 } }, "⚙️")
+      ),
+      e(Icons.Baby, { size: 26 })
+    )
   );
 }
 
@@ -226,6 +348,7 @@ function ViewTabs({ view, setView }) {
     { key: "day", label: "デイリー", icon: Icons.Calendar },
     { key: "week", label: "ウィークリー", icon: Icons.CalendarDays },
     { key: "year", label: "年次", icon: Icons.CalendarRange },
+    { key: "vaccine", label: "予防接種", icon: Icons.Syringe },
   ];
   return e(
     "div",
@@ -251,7 +374,7 @@ function ViewTabs({ view, setView }) {
 }
 
 // ---------------- デイリービュー ----------------
-function DayView({ logs, dayCursor, setDayCursor, onAction, onRemove }) {
+function DayView({ logs, twins, dayCursor, setDayCursor, onAction, onRemove }) {
   const dayLogs = useMemo(
     () => logs.filter((l) => l.day === dayCursor).sort((a, b) => (a.time < b.time ? 1 : -1)),
     [logs, dayCursor]
@@ -272,16 +395,16 @@ function DayView({ logs, dayCursor, setDayCursor, onAction, onRemove }) {
     e(
       "div",
       { style: styles.twinGrid },
-      Object.values(TWINS_DEFAULT).map((twin) =>
+      Object.values(twins).map((twin) =>
         e(TwinColumn, {
           key: twin.id,
           twin,
           logs: dayLogs.filter((l) => l.twin === twin.id),
-          onAction: isToday ? (type) => onAction(twin.id, type) : null,
+          onAction: (type) => onAction(twin.id, type, dayCursor),
         })
       )
     ),
-    e(Timeline, { logs: dayLogs, onRemove })
+    e(Timeline, { logs: dayLogs, twins, onRemove })
   );
 }
 
@@ -327,24 +450,23 @@ function TwinColumn({ twin, logs, onAction }) {
         value: isSleeping ? "睡眠中" : lastSleep ? `起床 ${lastSleep.time}` : "—",
       })
     ),
-    onAction
-      ? e(
-          "div",
-          { style: styles.actionGrid },
-          Object.entries(EVENT_TYPES).map(([key, cfg]) =>
-            e(
-              "button",
-              {
-                key,
-                style: { ...styles.actionBtn, borderColor: twin.color },
-                onClick: () => onAction(key),
-              },
-              e(cfg.icon, { size: 18 }),
-              e("span", { style: { ...styles.actionLabel, color: twin.color } }, cfg.label)
-            )
-          )
-        )
-      : e("div", { style: styles.pastNotice }, "過去の日付には記録を追加できません")
+    e(
+      "div",
+      { style: styles.actionGrid },
+      PRIMARY_EVENT_KEYS.map((key) => {
+        const cfg = EVENT_TYPES[key];
+        return e(
+          "button",
+          {
+            key,
+            style: { ...styles.actionBtn, borderColor: twin.color },
+            onClick: () => onAction(key),
+          },
+          e(cfg.icon, { size: 18 }),
+          e("span", { style: { ...styles.actionLabel, color: twin.color } }, cfg.label)
+        );
+      })
+    )
   );
 }
 
@@ -357,7 +479,7 @@ function Stat({ label, value }) {
   );
 }
 
-function Timeline({ logs, onRemove }) {
+function Timeline({ logs, twins, onRemove }) {
   return e(
     "div",
     { style: styles.timelineWrap },
@@ -372,13 +494,13 @@ function Timeline({ logs, onRemove }) {
       : e(
           "div",
           { style: styles.timelineList },
-          logs.map((log) => e(TimelineRow, { key: log.id, log, onRemove }))
+          logs.map((log) => e(TimelineRow, { key: log.id, log, twins, onRemove }))
         )
   );
 }
 
-function TimelineRow({ log, onRemove }) {
-  const twin = TWINS_DEFAULT[log.twin];
+function TimelineRow({ log, twins, onRemove }) {
+  const twin = twins[log.twin];
   const cfg = EVENT_TYPES[log.type];
 
   function describe() {
@@ -386,7 +508,15 @@ function TimelineRow({ log, onRemove }) {
     if (log.type === "feed") return `${d.amount ? d.amount + "ml" : ""} ${d.method || ""}`.trim();
     if (log.type === "sleep") return d.state;
     if (log.type === "diaper") return d.kind;
+    if (log.type === "burp") return d.kind || "";
     if (log.type === "temp") return `${d.value}℃`;
+    if (log.type === "growth") {
+      const parts = [];
+      if (d.height) parts.push(`${d.height}cm`);
+      if (d.weight) parts.push(`${d.weight}kg`);
+      return parts.join(" / ");
+    }
+    if (log.type === "vaccine") return d.vaccineName || "";
     return "";
   }
 
@@ -420,7 +550,7 @@ function getWeekStart(dateKeyStr) {
   return addDays(d, -offset);
 }
 
-function WeekView({ logs, weekCursor, setWeekCursor }) {
+function WeekView({ logs, twins, weekCursor, setWeekCursor }) {
   const weekStart = getWeekStart(weekCursor);
   const weekDays = useMemo(
     () => Array.from({ length: 7 }, (_, i) => dayKey(addDays(weekStart, i))),
@@ -443,7 +573,7 @@ function WeekView({ logs, weekCursor, setWeekCursor }) {
     e(
       "div",
       { style: styles.twinGridStack },
-      Object.values(TWINS_DEFAULT).map((twin) =>
+      Object.values(twins).map((twin) =>
         e(WeekTwinBlock, {
           key: twin.id,
           twin,
@@ -568,7 +698,7 @@ function SummaryChip({ label, value }) {
 }
 
 // ---------------- 年次ビュー ----------------
-function YearView({ logs, yearCursor, setYearCursor }) {
+function YearView({ logs, twins, yearCursor, setYearCursor }) {
   const isCurrentYear = yearCursor === new Date().getFullYear();
   return e(
     React.Fragment,
@@ -583,7 +713,7 @@ function YearView({ logs, yearCursor, setYearCursor }) {
     e(
       "div",
       { style: styles.twinGridStack },
-      Object.values(TWINS_DEFAULT).map((twin) =>
+      Object.values(twins).map((twin) =>
         e(YearTwinBlock, {
           key: twin.id,
           twin,
@@ -697,20 +827,162 @@ function MonthBarRow({ months, getValue, max, color, year, opacity = 1 }) {
   );
 }
 
-// ---------------- 記録入力シート ----------------
-function EntrySheet({ twin, type, onSave, onClose }) {
+// ---------------- 予防接種ビュー ----------------
+function VaccineView({ logs, twins, settingsDoc, onAction, onRemove }) {
+  const hasBirthA = !!settingsDoc.birthDateA;
+  const hasBirthB = !!settingsDoc.birthDateB;
+
+  return e(
+    React.Fragment,
+    null,
+    e(
+      "div",
+      { style: styles.vaccineIntro },
+      "ここに表示される接種目安日は標準的なスケジュールに基づく目安です。実際の接種は必ず医療機関・母子手帳でご確認ください。"
+    ),
+    e(
+      "div",
+      { style: styles.twinGridStack },
+      Object.values(twins).map((twin) =>
+        e(VaccineTwinBlock, {
+          key: twin.id,
+          twin,
+          birthDate: twin.id === "a" ? settingsDoc.birthDateA : settingsDoc.birthDateB,
+          logs: logs.filter((l) => l.twin === twin.id && l.type === "vaccine"),
+          onAction: () => onAction(twin.id, "vaccine", dayKey()),
+          onRemove,
+        })
+      )
+    )
+  );
+}
+
+function VaccineTwinBlock({ twin, birthDate, logs, onAction, onRemove }) {
+  const takenIds = useMemo(() => new Set(logs.map((l) => l.detail.vaccineId)), [logs]);
+  const today = new Date();
+  const birth = birthDate ? parseDayKeyFlexible(birthDate) : null;
+  const currentMonths = birth ? monthsBetween(birth, today) : null;
+
+  return e(
+    "div",
+    { style: { ...styles.weekBlock, borderColor: twin.color } },
+    e(
+      "div",
+      { style: { ...styles.columnHeader, background: twin.soft } },
+      e("span", { style: { ...styles.columnDot, background: twin.color } }),
+      e("span", { style: { ...styles.columnName, color: twin.color } }, twin.label),
+      currentMonths !== null &&
+        e("span", { style: styles.vaccineAgeTag }, `生後${currentMonths}か月`),
+      e(
+        "button",
+        {
+          style: { ...styles.vaccineAddBtn, borderColor: twin.color, color: twin.color },
+          onClick: onAction,
+        },
+        "＋ 記録する"
+      )
+    ),
+    !birth &&
+      e(
+        "div",
+        { style: styles.emptyState },
+        "生年月日が未設定です。設定(⚙️)から生年月日を入力すると、接種目安日が表示されます。"
+      ),
+    e(
+      "div",
+      { style: styles.vaccineList },
+      VACCINE_LIST.map((v) => {
+        const taken = takenIds.has(v.id);
+        const takenLog = logs.find((l) => l.detail.vaccineId === v.id);
+        let dueLabel = "";
+        let isOverdue = false;
+        if (birth && !taken) {
+          const due = calcVaccineDueDate(birth, v.standardMonths);
+          dueLabel = `目安: ${due.getFullYear()}/${due.getMonth() + 1}/${due.getDate()}`;
+          isOverdue = due < today;
+        }
+        return e(
+          "div",
+          { key: v.id, style: styles.vaccineRow },
+          e(
+            "div",
+            { style: styles.vaccineRowMain },
+            e(
+              "div",
+              { style: styles.vaccineName },
+              v.name,
+              v.optional && e("span", { style: styles.vaccineOptionalTag }, "任意")
+            ),
+            v.note && e("div", { style: styles.vaccineNote }, v.note),
+            !taken &&
+              birth &&
+              e(
+                "div",
+                { style: { ...styles.vaccineDue, color: isOverdue ? "#A8503A" : "#9A9690" } },
+                dueLabel
+              ),
+            taken &&
+              e(
+                "div",
+                { style: styles.vaccineTakenDate },
+                `接種済み: ${takenLog.day}`
+              )
+          ),
+          taken
+            ? e(
+                "button",
+                {
+                  style: styles.vaccineUndoBtn,
+                  onClick: () => onRemove(takenLog.id),
+                  "aria-label": "取り消す",
+                },
+                e(Icons.X, { size: 14 })
+              )
+            : e(
+                "div",
+                { style: { ...styles.vaccineStatusDot, background: isOverdue ? "#E8896B" : "#D8D3C8" } }
+              )
+        );
+      })
+    )
+  );
+}
+
+// "YYYY-MM-DD" 形式の日付文字列をDateに変換(parseDayKeyと同じだが命名を分けて意図を明確化)
+function parseDayKeyFlexible(key) {
+  return parseDayKey(key);
+}
+
+function EntrySheet({ twin, type, recordDay, onSave, onClose }) {
   const cfg = EVENT_TYPES[type];
   const [amount, setAmount] = useState("");
   const [method, setMethod] = useState("ミルク");
   const [sleepState, setSleepState] = useState("寝た");
-  const [diaperKind, setDiaperKind] = useState("おしっこ");
+  const [burpKind, setBurpKind] = useState("ゲップ");
   const [temp, setTemp] = useState("36.5");
+  const [height, setHeight] = useState("");
+  const [weight, setWeight] = useState("");
+  const [vaccineId, setVaccineId] = useState(VACCINE_LIST[0].id);
+
+  // 記録する日付・時刻。デフォルトは「今見ている日付」+「現在時刻」。
+  // 過去に遡って記録したい場合は、ここで自由に変更できる。
+  const [entryDay, setEntryDay] = useState(recordDay || dayKey());
+  const [entryTime, setEntryTime] = useState(nowHHMM());
 
   function handleSave() {
-    if (type === "feed") onSave({ amount, method });
-    else if (type === "sleep") onSave({ state: sleepState });
-    else if (type === "diaper") onSave({ kind: diaperKind });
-    else if (type === "temp") onSave({ value: temp });
+    let detail = {};
+    if (type === "feed") detail = { amount, method };
+    else if (type === "sleep") detail = { state: sleepState };
+    else if (type === "pee") detail = {};
+    else if (type === "poop") detail = {};
+    else if (type === "burp") detail = { kind: burpKind };
+    else if (type === "temp") detail = { value: temp };
+    else if (type === "growth") detail = { height, weight };
+    else if (type === "vaccine") {
+      const v = VACCINE_LIST.find((item) => item.id === vaccineId);
+      detail = { vaccineId, vaccineName: v ? v.name : vaccineId };
+    }
+    onSave(detail, entryDay, entryTime);
   }
 
   return e(
@@ -760,15 +1032,21 @@ function EntrySheet({ twin, type, onSave, onClose }) {
             e(FieldLabel, null, "状態"),
             e(SegButtons, { options: ["寝た", "起きた"], value: sleepState, onChange: setSleepState, accent: twin.color })
           ),
-        type === "diaper" &&
+        (type === "pee" || type === "poop") &&
+          e(
+            "div",
+            { style: styles.sheetTimeNote },
+            `「${cfg.label}」として記録します。`
+          ),
+        type === "burp" &&
           e(
             React.Fragment,
             null,
             e(FieldLabel, null, "種類"),
             e(SegButtons, {
-              options: ["おしっこ", "うんち", "両方"],
-              value: diaperKind,
-              onChange: setDiaperKind,
+              options: ["ゲップ", "吐き戻し"],
+              value: burpKind,
+              onChange: setBurpKind,
               accent: twin.color,
             })
           ),
@@ -786,7 +1064,71 @@ function EntrySheet({ twin, type, onSave, onClose }) {
               onChange: (ev) => setTemp(ev.target.value),
             })
           ),
-        e("div", { style: styles.sheetTimeNote }, `記録時刻: ${nowHHMM()}（現在時刻）`)
+        type === "growth" &&
+          e(
+            React.Fragment,
+            null,
+            e(FieldLabel, null, "身長（cm・任意）"),
+            e("input", {
+              style: styles.input,
+              type: "number",
+              inputMode: "decimal",
+              step: "0.1",
+              placeholder: "例: 58.5",
+              value: height,
+              onChange: (ev) => setHeight(ev.target.value),
+            }),
+            e(FieldLabel, null, "体重（kg・任意）"),
+            e("input", {
+              style: styles.input,
+              type: "number",
+              inputMode: "decimal",
+              step: "0.01",
+              placeholder: "例: 5.20",
+              value: weight,
+              onChange: (ev) => setWeight(ev.target.value),
+            })
+          ),
+        type === "vaccine" &&
+          e(
+            React.Fragment,
+            null,
+            e(FieldLabel, null, "ワクチンの種類"),
+            e(
+              "select",
+              {
+                style: styles.input,
+                value: vaccineId,
+                onChange: (ev) => setVaccineId(ev.target.value),
+              },
+              VACCINE_LIST.map((v) =>
+                e("option", { key: v.id, value: v.id }, v.name + (v.optional ? "(任意)" : ""))
+              )
+            )
+          ),
+        e(FieldLabel, null, "記録する日付・時刻"),
+        e(
+          "div",
+          { style: styles.dateTimeRow },
+          e("input", {
+            style: { ...styles.input, flex: 1.3 },
+            type: "date",
+            value: entryDay,
+            max: dayKey(),
+            onChange: (ev) => setEntryDay(ev.target.value),
+          }),
+          e("input", {
+            style: { ...styles.input, flex: 1 },
+            type: "time",
+            value: entryTime,
+            onChange: (ev) => setEntryTime(ev.target.value),
+          })
+        ),
+        e(
+          "div",
+          { style: styles.sheetTimeNote },
+          "つけ忘れた記録は、日付・時刻を過去に変更してから保存できます。"
+        )
       ),
       e(
         "button",
@@ -800,6 +1142,107 @@ function EntrySheet({ twin, type, onSave, onClose }) {
 
 function FieldLabel({ children }) {
   return e("div", { style: styles.fieldLabel }, children);
+}
+
+// ---------------- 設定シート(双子の名前変更) ----------------
+function SettingsSheet({ twins, settingsDoc, onSave, onClose }) {
+  const [nameA, setNameA] = useState(twins.a.label);
+  const [nameB, setNameB] = useState(twins.b.label);
+  const [birthDateA, setBirthDateA] = useState(settingsDoc.birthDateA || "");
+  const [birthDateB, setBirthDateB] = useState(settingsDoc.birthDateB || "");
+
+  function handleSave() {
+    const trimmedA = nameA.trim();
+    const trimmedB = nameB.trim();
+    onSave({
+      a: trimmedA || twins.a.label,
+      b: trimmedB || twins.b.label,
+      birthDateA,
+      birthDateB,
+    });
+  }
+
+  return e(
+    "div",
+    { style: styles.overlay, onClick: onClose },
+    e(
+      "div",
+      { style: styles.sheet, onClick: (ev) => ev.stopPropagation() },
+      e(
+        "div",
+        { style: styles.sheetHeader },
+        e("div", { style: styles.sheetTitle }, "名前・生年月日の設定"),
+        e(
+          "button",
+          { style: styles.sheetClose, onClick: onClose, "aria-label": "閉じる" },
+          e(Icons.X, { size: 20 })
+        )
+      ),
+      e(
+        "div",
+        { style: styles.sheetBody },
+        e(
+          "div",
+          { style: { ...styles.sheetTwinTag, background: twins.a.soft, color: twins.a.color } },
+          "1人目"
+        ),
+        e("input", {
+          style: styles.input,
+          type: "text",
+          value: nameA,
+          maxLength: 10,
+          placeholder: "例: あんず",
+          onChange: (ev) => setNameA(ev.target.value),
+        }),
+        e(FieldLabel, null, "生年月日(予防接種の目安計算に使用)"),
+        e("input", {
+          style: styles.input,
+          type: "date",
+          value: birthDateA,
+          max: dayKey(),
+          onChange: (ev) => setBirthDateA(ev.target.value),
+        }),
+        e(
+          "div",
+          {
+            style: {
+              ...styles.sheetTwinTag,
+              background: twins.b.soft,
+              color: twins.b.color,
+              marginTop: 18,
+            },
+          },
+          "2人目"
+        ),
+        e("input", {
+          style: styles.input,
+          type: "text",
+          value: nameB,
+          maxLength: 10,
+          placeholder: "例: みかん",
+          onChange: (ev) => setNameB(ev.target.value),
+        }),
+        e(FieldLabel, null, "生年月日(予防接種の目安計算に使用)"),
+        e("input", {
+          style: styles.input,
+          type: "date",
+          value: birthDateB,
+          max: dayKey(),
+          onChange: (ev) => setBirthDateB(ev.target.value),
+        }),
+        e(
+          "div",
+          { style: styles.sheetTimeNote },
+          "名前・生年月日はFirestoreに保存され、夫婦どちらの端末でも同じ内容が表示されます。"
+        )
+      ),
+      e(
+        "button",
+        { style: { ...styles.saveBtn, background: "#3A3A38" }, onClick: handleSave },
+        "保存する"
+      )
+    )
+  );
 }
 
 function SegButtons({ options, value, onChange, accent }) {
@@ -831,10 +1274,12 @@ const styles = {
   page: { fontFamily: "'Hiragino Sans','Yu Gothic',-apple-system,BlinkMacSystemFont,sans-serif", background: "#FAF7F2", minHeight: "100vh", padding: "16px 14px 40px", color: "#3A3A38", maxWidth: 480, margin: "0 auto", boxSizing: "border-box" },
   loadingPage: { display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", color: "#9A9690", fontSize: 14, fontFamily: "'Hiragino Sans',sans-serif" },
   header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, padding: "4px 4px 14px", borderBottom: "1px solid #E7E2D8" },
+  headerRight: { display: "flex", alignItems: "center", gap: 10 },
+  settingsBtn: { border: "none", background: "#F2EEE5", borderRadius: "50%", width: 32, height: 32, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" },
   headerEyebrow: { fontSize: 11, letterSpacing: "0.12em", color: "#9A9690", marginBottom: 2 },
   headerDate: { fontSize: 19, fontWeight: 700, letterSpacing: "0.01em" },
-  tabRow: { display: "flex", gap: 6, marginBottom: 16, background: "#EFEAE0", borderRadius: 12, padding: 4 },
-  tabBtn: { flex: 1, border: "none", borderRadius: 9, padding: "8px 4px", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, cursor: "pointer" },
+  tabRow: { display: "flex", gap: 4, marginBottom: 16, background: "#EFEAE0", borderRadius: 12, padding: 4, overflowX: "auto" },
+  tabBtn: { flex: 1, border: "none", borderRadius: 9, padding: "8px 2px", fontSize: 10.5, fontWeight: 700, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, cursor: "pointer", whiteSpace: "nowrap" },
   errorBanner: { background: "#FBEAE3", color: "#A8503A", fontSize: 12, padding: "8px 12px", borderRadius: 10, marginBottom: 14 },
   dayNav: { display: "flex", alignItems: "center", justifyContent: "center", gap: 14, marginBottom: 14 },
   navArrow: { border: "none", background: "none", fontSize: 22, color: "#9A9690", cursor: "pointer", padding: "0 8px", lineHeight: 1 },
@@ -855,6 +1300,19 @@ const styles = {
   actionBtn: { display: "flex", flexDirection: "column", alignItems: "center", gap: 4, border: "1.3px solid", borderRadius: 12, background: "#FFFFFF", padding: "10px 4px", cursor: "pointer" },
   actionLabel: { fontSize: 10.5, fontWeight: 600, lineHeight: 1.2, textAlign: "center" },
   pastNotice: { fontSize: 11, color: "#B5B0A4", padding: "14px 12px", textAlign: "center", lineHeight: 1.6 },
+  vaccineIntro: { fontSize: 11.5, color: "#7A7670", background: "#F2EEE5", borderRadius: 10, padding: "10px 12px", marginBottom: 14, lineHeight: 1.6 },
+  vaccineAddBtn: { marginLeft: "auto", border: "1.3px solid", borderRadius: 999, background: "#FFFFFF", padding: "5px 12px", fontSize: 11.5, fontWeight: 700, cursor: "pointer" },
+  vaccineAgeTag: { fontSize: 10.5, color: "#7A7670", background: "#FFFFFFAA", padding: "2px 8px", borderRadius: 999, marginLeft: 6 },
+  vaccineList: { display: "flex", flexDirection: "column" },
+  vaccineRow: { display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 14px", borderBottom: "1px solid #F2EEE5" },
+  vaccineRowMain: { flex: 1, minWidth: 0 },
+  vaccineName: { fontSize: 13.5, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 },
+  vaccineOptionalTag: { fontSize: 9.5, color: "#9A9690", fontWeight: 500, background: "#F2EEE5", padding: "1px 6px", borderRadius: 999 },
+  vaccineNote: { fontSize: 10.5, color: "#9A9690", marginTop: 2, lineHeight: 1.5 },
+  vaccineDue: { fontSize: 11, marginTop: 4, fontWeight: 600 },
+  vaccineTakenDate: { fontSize: 11, color: "#5E8B6E", marginTop: 4, fontWeight: 600 },
+  vaccineStatusDot: { width: 10, height: 10, borderRadius: "50%", marginTop: 4, flexShrink: 0 },
+  vaccineUndoBtn: { border: "none", background: "#F2EEE5", borderRadius: "50%", width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "#7A7670", flexShrink: 0, marginTop: 2 },
   timelineWrap: { background: "#FFFFFF", borderRadius: 16, border: "1px solid #ECE7DD", padding: 14 },
   timelineTitle: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#7A7670", marginBottom: 10, letterSpacing: "0.04em" },
   emptyState: { fontSize: 13, color: "#9A9690", lineHeight: 1.7, padding: "12px 4px" },
@@ -889,6 +1347,7 @@ const styles = {
   sheetBody: { marginBottom: 18 },
   fieldLabel: { fontSize: 12, fontWeight: 700, color: "#7A7670", marginTop: 14, marginBottom: 7 },
   segRow: { display: "flex", gap: 6, flexWrap: "wrap" },
+  dateTimeRow: { display: "flex", gap: 6 },
   segBtn: { border: "1.5px solid", borderRadius: 999, padding: "8px 16px", fontSize: 13, fontWeight: 600, cursor: "pointer" },
   input: { width: "100%", border: "1.5px solid #E7E2D8", borderRadius: 10, padding: "10px 12px", fontSize: 15, boxSizing: "border-box" },
   sheetTimeNote: { fontSize: 11, color: "#9A9690", marginTop: 14 },
