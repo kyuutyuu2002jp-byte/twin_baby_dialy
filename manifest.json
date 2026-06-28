@@ -1,46 +1,31 @@
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="theme-color" content="#FAF7F2" />
-<title>ふたごノート</title>
-
-<!-- PWA -->
-<link rel="manifest" href="./manifest.json" />
-<link rel="apple-touch-icon" href="./icons/icon-192.png" />
-<meta name="apple-mobile-web-app-capable" content="yes" />
-<meta name="apple-mobile-web-app-status-bar-style" content="default" />
-<meta name="apple-mobile-web-app-title" content="ふたごノート" />
-
-<style>
-  html, body { margin: 0; padding: 0; background: #FAF7F2; }
-  * { -webkit-tap-highlight-color: transparent; }
-  button { font-family: inherit; }
-  #root { min-height: 100vh; }
-</style>
-
-<!-- React (UMD build, no bundler needed) -->
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-
-<!-- Firebase modular SDK は app.js 内で ESM import するため type="module" で読み込む -->
-</head>
-<body>
-<div id="root"></div>
-
-<!-- アプリ本体。設定ファイルを先に読み込む -->
-<script src="./firebase-config.js"></script>
-<script type="module" src="./app.js"></script>
-
-<script>
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('./sw.js').catch(() => {
-        // Service Worker登録失敗時はオフライン機能なしで継続
-      });
-    });
-  }
-</script>
-</body>
-</html>
+{
+  "name": "ふたごノート",
+  "short_name": "ふたごノート",
+  "description": "双子の育児記録(授乳・睡眠・おむつ・体温)を夫婦で共有するアプリ",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#FAF7F2",
+  "theme_color": "#FAF7F2",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
